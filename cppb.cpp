@@ -1,9 +1,25 @@
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <vector>
 
 namespace cppb {
+namespace internal {
+auto RebuildRequired(const std::filesystem::path& BinaryPath,
+                     const std::filesystem::path& SourcePath) -> bool {
+    if (!std::filesystem::exists(BinaryPath))
+        return true;
+    if (!std::filesystem::exists(SourcePath))
+        return false;
+
+    // if our own source code was modified later than the binary we need to
+    // rebuild
+    return std::filesystem::last_write_time(SourcePath) >
+           std::filesystem::last_write_time(BinaryPath);
+}
+
+} // namespace internal
 class Library {
   public:
     std::filesystem::path Path;
@@ -31,7 +47,7 @@ class Linker {
               const std::filesystem::path& Output) -> int {
         std::string cmd =
             LinkCommandBuilder(Objects, LibraryNames, LibraryPaths, Output);
-        std::cout << "Linker: " << cmd << "\n";
+        std::cout << "Linking: " << cmd << "\n";
         return std::system(cmd.c_str());
     }
 };
@@ -50,28 +66,22 @@ class Compiler {
     auto Compile(const std::filesystem::path& Source,
                  const std::filesystem::path& Output) const -> int {
         std::string cmd = CompileCommandBuilder(Source, Output);
-        std::cout << "Compiler: " << cmd << "\n";
+        std::cout << "Compiling: " << cmd << "\n";
         return std::system(cmd.c_str());
     }
 };
 class SourceFile {
+
   public:
-    std::filesystem::path Path;
-    std::filesystem::path OutObjectPath;
-    auto RebuildRequired() -> bool {
-
-        if (!std::filesystem::exists(OutObjectPath))
-            return true;
-        if (!std::filesystem::exists(Path))
-            return false;
-
-        // if our own source code was modified later than the binary we need to
-        // rebuild
-        return std::filesystem::last_write_time(Path) >
-               std::filesystem::last_write_time(OutObjectPath);
+    SourceFile() = delete;
+    SourceFile(const std::filesystem::path& Path) : Path(Path) {}
+    auto RebuildRequired(const std::filesystem::path& BuildDir) -> bool {
+        std::filesystem::path OutObjectPath = GetOutObjectPath(BuildDir);
+        return internal::RebuildRequired(OutObjectPath, Path);
     }
-    auto Build(const Compiler& Comp) -> bool {
-
+    auto Build(const Compiler& Comp, const std::filesystem::path& BuildDir)
+        -> bool {
+        std::filesystem::path OutObjectPath = GetOutObjectPath(BuildDir);
         int Ret = Comp.Compile(Path, OutObjectPath);
         if (Ret != 0) {
             std::cout << "[-] Compiler returned non 0 exit code: " << Ret
@@ -79,16 +89,21 @@ class SourceFile {
         }
         return Ret == 0;
     }
-};
-class Target {
-    Compiler Cmp;
-    Linker Lnk;
-    Target() = delete;
+
+  private:
+    auto GetOutObjectPath(const std::filesystem::path& BuildDir)
+        -> std::filesystem::path {
+        std::string ObjectName =
+            Path.filename().replace_extension(".o").string();
+        return BuildDir / ObjectName;
+    }
 
   public:
-    std::vector<Library> Libraries;
-    std::string BinaryName;
-
+    std::filesystem::path Path;
+};
+class Target {
+  public:
+    Target() = delete;
     Target(const std::string& binaryName, Compiler&& Comp, Linker&& Link)
         : Cmp(std::move(Comp)), Lnk(std::move(Link)), BinaryName(binaryName) {}
     Target(const std::string& binaryName, Compiler& Comp, Linker& Link)
@@ -98,15 +113,49 @@ class Target {
            std::vector<Library>& Libs)
         : Cmp(Comp), Lnk(Link), Libraries(Libs), BinaryName(binaryName) {}
 
-    std::vector<SourceFile> Sources;
-    auto Build(const std::filesystem::path& BuildDir) -> bool {
+    auto Build(const std::filesystem::path& BuildDir, bool RebuildAll = false)
+        -> bool {
+        if (!Compile(RebuildAll, BuildDir))
+            return false;
+        if (!Link(BuildDir))
+            return false;
+
+        return true;
+    }
+
+  private:
+    auto Link(const std::filesystem::path& BuildDir) -> bool {
+        std::vector<std::filesystem::path> Paths{GetPaths()};
+        auto [LibraryNames, LibraryPaths] = ParseLibraries();
+
+        int ret{
+            Lnk.Link(Paths, LibraryNames, LibraryPaths, BuildDir / BinaryName)};
+        if (ret != 0) {
+            std::cout << "[-] Linker returned non 0 exit code: " << ret << "\n";
+            return false;
+        }
+        return true;
+    }
+    auto Compile(bool RebuildAll, const std::filesystem::path& BuildDir)
+        -> bool {
+        for (auto src : Sources) {
+            if (RebuildAll || src.RebuildRequired(BuildDir))
+                if (!src.Build(Cmp, BuildDir))
+                    return false;
+        }
+        return true;
+    }
+    auto GetPaths() -> std::vector<std::filesystem::path> {
         std::vector<std::filesystem::path> Paths{};
         for (auto src : Sources) {
             Paths.push_back(src.Path);
-            if (src.RebuildRequired())
-                if (!src.Build(Cmp))
-                    return false;
         }
+        return Paths;
+    }
+    auto ParseLibraries() const
+        -> std::pair<std::vector<std::filesystem::path>,
+                     std::vector<std::filesystem::path>> {
+
         std::vector<std::filesystem::path> LibraryNames;
         std::vector<std::filesystem::path> LibraryPaths;
         for (auto Lib : Libraries) {
@@ -114,21 +163,23 @@ class Target {
                 continue;
 
             if (Lib.Path.has_parent_path() &&
-                std::find(LibraryPaths.begin(), LibraryPaths.end(),
-                          Lib.Path.parent_path()) == LibraryPaths.end())
+                std::find(begin(LibraryPaths), end(LibraryPaths),
+                          Lib.Path.parent_path()) == end(LibraryPaths))
                 LibraryPaths.push_back(Lib.Path.parent_path());
 
             LibraryNames.push_back(Lib.Path.filename());
         }
-        int ret =
-            Lnk.Link(Paths, LibraryNames, LibraryPaths, BuildDir / BinaryName);
-        if (ret != 0) {
-            std::cout << "[-] Linker returned non 0 exit code: " << ret << "\n";
-            return false;
-        }
-        return true;
+        return {LibraryNames, LibraryPaths};
     }
-    auto ReBuild() -> void {}
+
+  private:
+    Compiler Cmp;
+    Linker Lnk;
+
+  public:
+    std::vector<Library> Libraries;
+    std::vector<SourceFile> Sources;
+    std::string BinaryName;
 };
 class Project {
   public:
@@ -142,27 +193,80 @@ class Project {
         return true;
     }
 };
+class BuildScript {
 
-auto RebuildSelf() -> void {}
+  public:
+    BuildScript() = delete;
+    BuildScript(const std::filesystem::path& BinaryPath,
+                const std::filesystem::path& SourcePath)
+        : BinaryPath(BinaryPath), SourcePath(SourcePath) {}
+
+    auto Execute() -> int { return std::system(BinaryPath.string().c_str()); }
+    // false = no rebuild, true = rebuilt
+    auto Rebuild(const Compiler& compiler) -> bool {
+        if (!RebuildRequired())
+            return false;
+        std::cout << "[+] Change in build script detected, rebuilding.\n";
+        if (MoveOldBinary()) {
+            std::cout << "[+] Moving old script binary.\n";
+        }
+        int ret = compiler.Compile(SourcePath, BinaryPath);
+        if (ret != 0) {
+            std::cout << "[-] Compiler returned non 0 exit code: " << ret
+                      << "\n";
+            return false;
+        }
+        return true;
+    }
+
+  private:
+    auto RebuildRequired() -> bool {
+        return internal::RebuildRequired(BinaryPath, SourcePath);
+    }
+    auto MoveOldBinary() -> bool {
+        if (!std::filesystem::exists(BinaryPath))
+            return false;
+        std::filesystem::path OldBinaryPath = BinaryPath;
+        OldBinaryPath.replace_extension(".old.exe");
+        if (std::filesystem::exists(OldBinaryPath)) {
+            std::filesystem::remove(OldBinaryPath);
+        }
+        std::filesystem::rename(BinaryPath, OldBinaryPath);
+        return true;
+    }
+
+  public:
+    std::filesystem::path BinaryPath;
+    std::filesystem::path SourcePath;
+};
 
 } // namespace cppb
 
 auto main(int argc, char** argv) -> int {
     (void)argc;
-    (void)argv;
+
+    cppb::BuildScript ThisScript{argv[0], __FILE__};
+
+    auto comp =
+        cppb::Compiler([](const auto& src, const auto& out) -> std::string {
+            return "clang++ -c " + src.string() + " -o " + out.string();
+        });
+
+    if (ThisScript.Rebuild(
+            cppb::Compiler([](const auto& src, const auto& out) -> std::string {
+                return "clang++ " + src.string() + " -o " + out.string();
+            }))) {
+        return ThisScript.Execute();
+    }
 
     std::filesystem::path BuildDir = "./build/";
 
     cppb::Project Proj{};
-    auto comp =
-        cppb::Compiler([](const auto& src, const auto& out) -> std::string {
-            return "c++.exe -c " + src.string() + " -o " + out.string();
-        });
 
     auto lnk =
         cppb::Linker([](const auto& objs, const auto& libNames,
                         const auto& libPaths, const auto& out) -> std::string {
-            std::string cmd = "c++.exe ";
+            std::string cmd = "clang++ ";
             for (auto obj : objs) {
                 cmd += " " + obj.string();
             }
@@ -178,10 +282,7 @@ auto main(int argc, char** argv) -> int {
 
     cppb::Target Target{"Test.exe", comp, lnk};
 
-    cppb::SourceFile testcpp{};
-    testcpp.Path = "./test.cpp";
-    testcpp.OutObjectPath = BuildDir / "obj/test.o";
-    Target.Sources.push_back(testcpp);
+    Target.Sources = {{"test.cpp"}};
 
     Proj.BuildTargets.push_back(Target);
 
