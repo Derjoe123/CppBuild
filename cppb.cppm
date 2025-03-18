@@ -1,10 +1,12 @@
+module;
 #include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <vector>
+export module cppb;
 
-namespace cppb {
+export namespace cppb {
 namespace internal {
 auto RebuildRequired(const std::filesystem::path& BinaryPath,
                      const std::filesystem::path& SourcePath) -> bool {
@@ -183,8 +185,15 @@ class Target {
 };
 class Project {
   public:
+    std::string Name;
+    std::string Version;
     std::vector<Target> BuildTargets;
     auto Build(const std::filesystem::path& BuildDir) -> bool {
+        if (!Name.empty() && !Version.empty())
+            std::cout << "Building Project: " << Name << " (" << Version
+                      << ").\n";
+        else if (!Name.empty())
+            std::cout << "Building Project: " << Name << ".\n";
         for (auto target : BuildTargets) {
             if (!target.Build(BuildDir)) {
                 return false;
@@ -241,55 +250,3 @@ class BuildScript {
 };
 
 } // namespace cppb
-
-auto main(int argc, char** argv) -> int {
-    (void)argc;
-
-    cppb::BuildScript ThisScript{argv[0], __FILE__};
-
-    auto comp =
-        cppb::Compiler([](const auto& src, const auto& out) -> std::string {
-            return "clang++ -c " + src.string() + " -o " + out.string();
-        });
-
-    if (ThisScript.Rebuild(
-            cppb::Compiler([](const auto& src, const auto& out) -> std::string {
-                return "clang++ " + src.string() + " -o " + out.string();
-            }))) {
-        return ThisScript.Execute();
-    }
-
-    std::filesystem::path BuildDir = "./build/";
-
-    cppb::Project Proj{};
-
-    auto lnk =
-        cppb::Linker([](const auto& objs, const auto& libNames,
-                        const auto& libPaths, const auto& out) -> std::string {
-            std::string cmd = "clang++ ";
-            for (auto obj : objs) {
-                cmd += " " + obj.string();
-            }
-            for (auto libPath : libPaths) {
-                cmd += " -L" + libPath.string();
-            }
-            for (auto lib : libNames) {
-                cmd += " -l" + lib.string();
-            }
-            cmd += " -o " + out.string();
-            return cmd;
-        });
-
-    cppb::Target Target{"Test.exe", comp, lnk};
-
-    Target.Sources = {{"test.cpp"}};
-
-    Proj.BuildTargets.push_back(Target);
-
-    bool buildSuccess = Proj.Build(BuildDir);
-    if (!buildSuccess) {
-        std::cout << "[-] Build unsuccessful!\n";
-        return 1;
-    }
-    return 0;
-}
