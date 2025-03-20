@@ -1,3 +1,3 @@
 #include <iostream>
 
-int main() { std::cout << "Hello, World test!\n"; }
+auto main() -> int { std::cout << "Hello, World test!\n"; }
